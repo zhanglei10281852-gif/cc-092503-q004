@@ -1,6 +1,20 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+
+class ConversionRuleCreate(BaseModel):
+    rule_code: str = Field(min_length=3, max_length=64)
+    from_unit: str = Field(min_length=1, max_length=20)
+    to_unit: str = Field(min_length=1, max_length=20)
+    factor: float = Field(gt=0)
+    note: str = Field(default="", max_length=500)
+
+    @model_validator(mode="after")
+    def ensure_distinct_units(self):
+        if self.from_unit == self.to_unit:
+            raise ValueError("换算前后单位不能相同")
+        return self
 
 
 class InventoryStart(BaseModel):

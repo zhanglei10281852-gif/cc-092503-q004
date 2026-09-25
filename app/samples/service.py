@@ -10,6 +10,12 @@ from typing import Any
 from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.core.security import Principal
+from app.samples.lineage import (
+    DEFAULT_TOLERANCE_RATIO,
+    ConversionRuleRepository,
+    LineageRepository,
+    canonical_digest,
+)
 from app.samples.repository import AnomalyRepository, ApprovalRepository, BatchRepository, LocationRepository, SampleRepository
 from app.services.audit import AuditService
 
@@ -104,17 +110,124 @@ class SampleLifecycleService:
         return sample
 
     def aliquot(self, principal: Principal, sample_id: int, data: dict[str, Any]) -> dict[str, Any]:
+        """提交一次谱系操作（分装/冻干/研磨/处理）。
+
+        在路由开启的事务内完成直接守恒校验与全部写入：子样合计加损耗必须在容差内
+        等于按换算规则折算后的分装数量；操作固化处理前后单位、换算规则快照、
+        可解释损耗、容差快照与操作版本，历史不受后续规则升级影响。
+        """
         principal.require("samples.write")
         parent = self.samples.get(sample_id)
-        total = round(sum(item["quantity"] for item in data["children"]) + data.get("loss_quantity", 0), 9)
-        if abs(total - data["requested_quantity"]) > 1e-6:
-            raise ValidationError("子样数量与损耗之和必须等于分装数量")
+        lineage = LineageRepository(self.connection)
+        input_unit = parent["unit"]
+        output_unit = data.get("output_unit") or input_unit
+        rule_code = data.get("conversion_rule_code")
+        rule_version = None
+        factor = 1.0
+        if output_unit != input_unit and not rule_code:
+            raise ValidationError("处理前后单位不一致，必须提供换算规则")
+        if rule_code:
+            rule = ConversionRuleRepository(self.connection).active(rule_code)
+            if rule is None:
+                raise ValidationError("换算规则不存在或已停用")
+            if rule["from_unit"] != input_unit or rule["to_unit"] != output_unit:
+                raise ValidationError("换算规则的单位方向与本次操作不一致")
+            if (
+                data.get("conversion_rule_version") is not None
+                and data["conversion_rule_version"] != rule["version"]
+            ):
+                raise ConflictError("换算规则已升级为新版本，请确认后重试")
+            factor = float(rule["factor"])
+            rule_version = int(rule["version"])
+        tolerance = data.get("tolerance_ratio")
+        if tolerance is None:
+            tolerance = DEFAULT_TOLERANCE_RATIO
+        loss = float(data.get("loss_quantity", 0))
+        loss_reason = (data.get("loss_reason") or "").strip()
+        if loss > 1e-9 and not loss_reason:
+            raise ValidationError("存在损耗时必须填写可解释的损耗原因")
+        children_data = data["children"]
+        codes = [item["sample_code"] for item in children_data]
+        if len(set(codes)) != len(codes):
+            raise ValidationError("子样编码在请求内重复")
+        produced = round(sum(item["quantity"] for item in children_data), 9)
+        expected = round(data["requested_quantity"] * factor, 9)
+        if abs(produced + loss - expected) > max(1e-6, tolerance * abs(expected)):
+            raise ValidationError("子样数量与损耗之和必须在容差内等于换算后的分装数量")
         if parent["quantity"] - parent["reserved_quantity"] < data["requested_quantity"]:
             raise ConflictError("可用数量不足")
+        digest = canonical_digest(
+            {
+                "parent_sample_id": sample_id,
+                "operation_kind": data.get("operation_kind", "aliquot"),
+                "requested_quantity": data["requested_quantity"],
+                "input_unit": input_unit,
+                "output_unit": output_unit,
+                "conversion_rule_code": rule_code,
+                "conversion_rule_version": rule_version,
+                "conversion_factor": factor,
+                "loss_quantity": loss,
+                "loss_reason": loss_reason,
+                "tolerance_ratio": tolerance,
+                "children": [
+                    {
+                        "sample_code": item["sample_code"],
+                        "quantity": item["quantity"],
+                        "sample_type": item.get("sample_type"),
+                        "location_id": item.get("location_id"),
+                    }
+                    for item in children_data
+                ],
+            }
+        )
+        operation_code = data.get("operation_code")
+        if operation_code:
+            existing = lineage.operation_by_code(operation_code)
+            if existing:
+                if existing["request_digest"] != digest:
+                    raise ConflictError("操作编码已被不同的分装请求占用")
+                return {
+                    "operation_code": operation_code,
+                    "operation": existing,
+                    "parent": self.samples.get(sample_id),
+                    "children": [
+                        self.samples.get(child_id)
+                        for child_id in lineage.operation_children(existing["id"])
+                    ],
+                    "replayed": True,
+                }
+        else:
+            operation_code = f"ALI-{uuid.uuid4().hex[:12]}"
+        for code in sorted(codes):
+            if self.samples.by_code(code):
+                raise ConflictError(f"子样编码已经存在: {code}")
         now = to_storage(self.clock.now())
-        updated_parent = self.samples.change_quantity(sample_id, -data["requested_quantity"], parent["version"], now)
+        updated_parent = self.samples.change_quantity(
+            sample_id, -data["requested_quantity"], parent["version"], now
+        )
+        operation = lineage.insert_operation(
+            {
+                "operation_code": operation_code,
+                "parent_sample_id": sample_id,
+                "operation_kind": data.get("operation_kind", "aliquot"),
+                "requested_quantity": data["requested_quantity"],
+                "produced_quantity": produced,
+                "loss_quantity": loss,
+                "input_unit": input_unit,
+                "output_unit": output_unit,
+                "conversion_rule_code": rule_code,
+                "conversion_rule_version": rule_version,
+                "conversion_factor": factor,
+                "loss_reason": loss_reason,
+                "tolerance_ratio": tolerance,
+                "request_digest": digest,
+                "operator_user_id": principal.user_id,
+                "note": data.get("note", ""),
+            },
+            now,
+        )
         children = []
-        for item in data["children"]:
+        for position, item in enumerate(children_data, start=1):
             child = self.samples.create(
                 {
                     "sample_code": item["sample_code"],
@@ -122,9 +235,9 @@ class SampleLifecycleService:
                     "collection_event_id": parent["collection_event_id"],
                     "parent_sample_id": sample_id,
                     "root_sample_id": parent["root_sample_id"],
-                    "sample_type": parent["sample_type"],
+                    "sample_type": item.get("sample_type") or parent["sample_type"],
                     "quantity": item["quantity"],
-                    "unit": parent["unit"],
+                    "unit": output_unit,
                     "lifecycle_state": "available",
                     "location_id": item.get("location_id", parent["location_id"]),
                     "custody_user_id": principal.user_id,
@@ -132,17 +245,12 @@ class SampleLifecycleService:
                 },
                 now,
             )
-            self.samples.append_event(child["id"], "aliquot.created", principal.user_id, now, to_state="available", details={"parent_sample_id": sample_id})
+            lineage.insert_child_link(operation["id"], child["id"], item["quantity"], position)
+            self.samples.append_event(child["id"], "aliquot.created", principal.user_id, now, to_state="available", details={"parent_sample_id": sample_id, "operation_code": operation_code})
             children.append(child)
-        operation_code = data.get("operation_code") or f"ALI-{uuid.uuid4().hex[:12]}"
-        self.connection.execute(
-            """INSERT INTO aliquot_operations(operation_code,parent_sample_id,requested_quantity,produced_quantity,loss_quantity,operator_user_id,occurred_at,note,created_at)
-               VALUES(?,?,?,?,?,?,?,?,?)""",
-            (operation_code, sample_id, data["requested_quantity"], sum(item["quantity"] for item in data["children"]), data.get("loss_quantity", 0), principal.user_id, now, data.get("note", ""), now),
-        )
         self.samples.append_event(sample_id, "aliquot.source", principal.user_id, now, quantity_delta=-data["requested_quantity"], details={"operation_code": operation_code, "child_ids": [item["id"] for item in children]})
         self.audit.record(principal, "sample.aliquot", "sample", str(sample_id), before=parent, after=updated_parent, metadata={"operation_code": operation_code})
-        return {"operation_code": operation_code, "parent": updated_parent, "children": children}
+        return {"operation_code": operation_code, "operation": operation, "parent": updated_parent, "children": children, "replayed": False}
 
     def consume(self, principal: Principal, sample_id: int, data: dict[str, Any]) -> dict[str, Any]:
         principal.require("samples.consume")

@@ -44,6 +44,7 @@ def test_aliquot_preserves_mass_and_lineage(client, admin):
         json={
             "requested_quantity": 30,
             "loss_quantity": 2,
+            "loss_reason": "分装转移残留",
             "children": [{"sample_code": "S-001-A", "quantity": 10}, {"sample_code": "S-001-B", "quantity": 18}],
             "note": "两份检测子样",
         },

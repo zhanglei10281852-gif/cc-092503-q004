@@ -34,13 +34,20 @@ class SampleCreate(BaseModel):
 class AliquotChild(BaseModel):
     sample_code: str = Field(min_length=3, max_length=100)
     quantity: float = Field(gt=0)
+    sample_type: str | None = Field(default=None, max_length=100)
     location_id: int | None = Field(default=None, gt=0)
 
 
 class AliquotRequest(BaseModel):
     operation_code: str | None = Field(default=None, max_length=64)
+    operation_kind: Literal["aliquot", "freeze_dry", "grind", "process"] = "aliquot"
     requested_quantity: float = Field(gt=0)
+    output_unit: str | None = Field(default=None, max_length=20)
+    conversion_rule_code: str | None = Field(default=None, max_length=64)
+    conversion_rule_version: int | None = Field(default=None, gt=0)
     loss_quantity: float = Field(default=0, ge=0)
+    loss_reason: str = Field(default="", max_length=200)
+    tolerance_ratio: float | None = Field(default=None, ge=0, le=0.2)
     children: list[AliquotChild] = Field(min_length=1, max_length=100)
     note: str = Field(default="", max_length=500)
 

@@ -199,18 +199,54 @@ CREATE INDEX IF NOT EXISTS idx_samples_batch ON samples(batch_id);
 CREATE INDEX IF NOT EXISTS idx_samples_parent ON samples(parent_sample_id);
 CREATE INDEX IF NOT EXISTS idx_samples_location ON samples(location_id);
 
+CREATE TABLE IF NOT EXISTS unit_conversion_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_code TEXT NOT NULL,
+    from_unit TEXT NOT NULL,
+    to_unit TEXT NOT NULL,
+    factor REAL NOT NULL CHECK(factor > 0),
+    version INTEGER NOT NULL DEFAULT 1 CHECK(version >= 1),
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','superseded','retired')),
+    note TEXT NOT NULL DEFAULT '',
+    created_by INTEGER REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    UNIQUE(rule_code, version)
+);
+
 CREATE TABLE IF NOT EXISTS aliquot_operations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     operation_code TEXT NOT NULL UNIQUE,
     parent_sample_id INTEGER NOT NULL REFERENCES samples(id),
+    operation_kind TEXT NOT NULL DEFAULT 'aliquot' CHECK(operation_kind IN ('aliquot','freeze_dry','grind','process')),
     requested_quantity REAL NOT NULL CHECK(requested_quantity > 0),
     produced_quantity REAL NOT NULL CHECK(produced_quantity >= 0),
     loss_quantity REAL NOT NULL CHECK(loss_quantity >= 0),
+    input_unit TEXT,
+    output_unit TEXT,
+    conversion_rule_code TEXT,
+    conversion_rule_version INTEGER,
+    conversion_factor REAL NOT NULL DEFAULT 1 CHECK(conversion_factor > 0),
+    loss_reason TEXT NOT NULL DEFAULT '',
+    tolerance_ratio REAL NOT NULL DEFAULT 0.005 CHECK(tolerance_ratio >= 0),
+    request_digest TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL DEFAULT 1,
     operator_user_id INTEGER NOT NULL REFERENCES users(id),
     occurred_at TEXT NOT NULL,
     note TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS aliquot_operation_children (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    operation_id INTEGER NOT NULL REFERENCES aliquot_operations(id),
+    child_sample_id INTEGER NOT NULL REFERENCES samples(id),
+    quantity REAL NOT NULL CHECK(quantity > 0),
+    position INTEGER NOT NULL CHECK(position > 0),
+    UNIQUE(operation_id, child_sample_id),
+    UNIQUE(operation_id, position)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_aliquot_child_once ON aliquot_operation_children(child_sample_id);
+CREATE INDEX IF NOT EXISTS idx_aliquot_children_operation ON aliquot_operation_children(operation_id);
 
 CREATE TABLE IF NOT EXISTS loans (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -361,6 +397,37 @@ def database_path() -> Path:
     return Path(raw).expanduser().resolve()
 
 
+# 既有数据库的谱系扩展迁移：为 aliquot_operations 补充单位、换算快照、损耗原因与版本列。
+# 全部语句幂等，可随 init_db 反复执行；历史行的单位按母样单位回填（母样单位在系统中不可变）。
+LINEAGE_COLUMN_MIGRATIONS = {
+    "operation_kind": "ALTER TABLE aliquot_operations ADD COLUMN operation_kind TEXT NOT NULL DEFAULT 'aliquot'",
+    "input_unit": "ALTER TABLE aliquot_operations ADD COLUMN input_unit TEXT",
+    "output_unit": "ALTER TABLE aliquot_operations ADD COLUMN output_unit TEXT",
+    "conversion_rule_code": "ALTER TABLE aliquot_operations ADD COLUMN conversion_rule_code TEXT",
+    "conversion_rule_version": "ALTER TABLE aliquot_operations ADD COLUMN conversion_rule_version INTEGER",
+    "conversion_factor": "ALTER TABLE aliquot_operations ADD COLUMN conversion_factor REAL NOT NULL DEFAULT 1",
+    "loss_reason": "ALTER TABLE aliquot_operations ADD COLUMN loss_reason TEXT NOT NULL DEFAULT ''",
+    "tolerance_ratio": "ALTER TABLE aliquot_operations ADD COLUMN tolerance_ratio REAL NOT NULL DEFAULT 0.005",
+    "request_digest": "ALTER TABLE aliquot_operations ADD COLUMN request_digest TEXT NOT NULL DEFAULT ''",
+    "version": "ALTER TABLE aliquot_operations ADD COLUMN version INTEGER NOT NULL DEFAULT 1",
+}
+
+
+def _migrate_lineage_schema(connection: sqlite3.Connection) -> None:
+    columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(aliquot_operations)").fetchall()
+    }
+    for name, statement in LINEAGE_COLUMN_MIGRATIONS.items():
+        if name not in columns:
+            connection.execute(statement)
+    connection.execute(
+        """UPDATE aliquot_operations SET
+               input_unit=(SELECT unit FROM samples WHERE samples.id=aliquot_operations.parent_sample_id),
+               output_unit=(SELECT unit FROM samples WHERE samples.id=aliquot_operations.parent_sample_id)
+           WHERE input_unit IS NULL"""
+    )
+
+
 def _create_connection() -> sqlite3.Connection:
     path = database_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -405,6 +472,7 @@ def init_db() -> None:
     now = to_storage(utc_now())
     connection = get_connection()
     connection.executescript(SCHEMA)
+    _migrate_lineage_schema(connection)
     with transaction(immediate=True) as connection:
         for code, name, resource, action in PERMISSIONS:
             connection.execute(

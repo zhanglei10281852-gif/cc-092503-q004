@@ -7,16 +7,29 @@ from app.database import get_connection, transaction
 from app.core.security import Principal
 from app.samples.extended_schemas import (
     CollectionCreate,
+    ConversionRuleCreate,
     DestructionExecute,
     InventoryCount,
     InventoryStart,
     TransferCreate,
 )
 from app.samples.inventory import InventoryService, StockSummaryService
+from app.samples.lineage import ConversionRuleService, LineageReportService, LineageTraceService
 from app.samples.operations import CollectionService, DestructionService, LineageService, TransferService
 from app.samples.reporting import BatchReconciliationService, ExceptionAgingService
 
 router = APIRouter(prefix="/api/sample-operations", tags=["样品作业"])
+
+
+@router.post("/conversion-rules", status_code=status.HTTP_201_CREATED)
+def register_conversion_rule(payload: ConversionRuleCreate, principal: Principal = Depends(current_principal)):
+    with transaction(immediate=True) as connection:
+        return ConversionRuleService(connection).register(principal, payload.model_dump())
+
+
+@router.get("/conversion-rules")
+def list_conversion_rules(rule_code: str | None = None, principal: Principal = Depends(current_principal)):
+    return ConversionRuleService(get_connection()).list(principal, rule_code)
 
 
 @router.post("/collections", status_code=status.HTTP_201_CREATED)
@@ -34,6 +47,21 @@ def transfer_sample(sample_id: int, payload: TransferCreate, principal: Principa
 @router.get("/{sample_id}/lineage")
 def sample_lineage(sample_id: int, principal: Principal = Depends(current_principal)):
     return LineageService(get_connection()).graph(principal, sample_id)
+
+
+@router.get("/{sample_id}/lineage/ancestors")
+def lineage_ancestors(sample_id: int, principal: Principal = Depends(current_principal)):
+    return LineageTraceService(get_connection()).ancestors(principal, sample_id)
+
+
+@router.get("/{sample_id}/lineage/rollup")
+def lineage_rollup(sample_id: int, principal: Principal = Depends(current_principal)):
+    return LineageTraceService(get_connection()).rollup(principal, sample_id)
+
+
+@router.get("/{sample_id}/lineage/report")
+def lineage_report(sample_id: int, principal: Principal = Depends(current_principal)):
+    return LineageReportService(get_connection()).report(principal, sample_id)
 
 
 @router.post("/inventory", status_code=status.HTTP_201_CREATED)
