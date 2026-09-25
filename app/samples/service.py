@@ -5,11 +5,13 @@ import json
 import sqlite3
 import uuid
 from datetime import timedelta
+from decimal import Decimal
 from typing import Any
 
 from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.core.security import Principal
+from app.samples.lineage import DEFAULT_TOLERANCE, ConversionRuleService, LineageOperationService, conservation_residual
 from app.samples.repository import AnomalyRepository, ApprovalRepository, BatchRepository, LocationRepository, SampleRepository
 from app.services.audit import AuditService
 
@@ -106,9 +108,38 @@ class SampleLifecycleService:
     def aliquot(self, principal: Principal, sample_id: int, data: dict[str, Any]) -> dict[str, Any]:
         principal.require("samples.write")
         parent = self.samples.get(sample_id)
-        total = round(sum(item["quantity"] for item in data["children"]) + data.get("loss_quantity", 0), 9)
-        if abs(total - data["requested_quantity"]) > 1e-6:
-            raise ValidationError("子样数量与损耗之和必须等于分装数量")
+        output_unit = data.get("output_unit") or parent["unit"]
+        rule: dict[str, Any] | None = None
+        factor = Decimal(1)
+        if output_unit == parent["unit"]:
+            if data.get("conversion_rule_code"):
+                raise ValidationError("同单位操作不需要换算规则")
+        else:
+            if not data.get("conversion_rule_code"):
+                raise ValidationError("跨单位操作必须指定换算规则")
+            rule = ConversionRuleService(self.connection, self.clock).resolve(
+                data["conversion_rule_code"], data.get("conversion_rule_version")
+            )
+            if rule["from_unit"] != parent["unit"] or rule["to_unit"] != output_unit:
+                raise ValidationError(
+                    "换算规则与操作单位不匹配",
+                    context={"rule": f"{rule['from_unit']}->{rule['to_unit']}", "operation": f"{parent['unit']}->{output_unit}"},
+                )
+            factor = Decimal(rule["factor"])
+        if data.get("tolerance") is not None:
+            tolerance = float(data["tolerance"])
+        elif rule is not None:
+            tolerance = float(rule["default_tolerance"])
+        else:
+            tolerance = DEFAULT_TOLERANCE
+        produced = sum(Decimal(str(item["quantity"])) for item in data["children"])
+        loss = Decimal(str(data.get("loss_quantity", 0)))
+        residual = conservation_residual(data["requested_quantity"], factor, produced, loss)
+        if abs(residual) > Decimal(str(tolerance)):
+            raise ValidationError(
+                "分装不满足直接守恒：换算后投入必须等于子样数量与损耗之和",
+                context={"residual": float(residual), "tolerance": tolerance},
+            )
         if parent["quantity"] - parent["reserved_quantity"] < data["requested_quantity"]:
             raise ConflictError("可用数量不足")
         now = to_storage(self.clock.now())
@@ -124,7 +155,7 @@ class SampleLifecycleService:
                     "root_sample_id": parent["root_sample_id"],
                     "sample_type": parent["sample_type"],
                     "quantity": item["quantity"],
-                    "unit": parent["unit"],
+                    "unit": output_unit,
                     "lifecycle_state": "available",
                     "location_id": item.get("location_id", parent["location_id"]),
                     "custody_user_id": principal.user_id,
@@ -138,11 +169,29 @@ class SampleLifecycleService:
         self.connection.execute(
             """INSERT INTO aliquot_operations(operation_code,parent_sample_id,requested_quantity,produced_quantity,loss_quantity,operator_user_id,occurred_at,note,created_at)
                VALUES(?,?,?,?,?,?,?,?,?)""",
-            (operation_code, sample_id, data["requested_quantity"], sum(item["quantity"] for item in data["children"]), data.get("loss_quantity", 0), principal.user_id, now, data.get("note", ""), now),
+            (operation_code, sample_id, data["requested_quantity"], float(produced), data.get("loss_quantity", 0), principal.user_id, now, data.get("note", ""), now),
+        )
+        operation = LineageOperationService(self.connection, self.clock).record(
+            operation_code=operation_code,
+            operation_kind=data.get("operation_kind") or "aliquot",
+            parent_sample_id=sample_id,
+            input_unit=parent["unit"],
+            output_unit=output_unit,
+            input_quantity=data["requested_quantity"],
+            output_quantity=float(produced),
+            loss_quantity=float(loss),
+            loss_reason=data.get("loss_reason", ""),
+            rule=rule,
+            factor=factor,
+            tolerance=tolerance,
+            children=children,
+            operator_user_id=principal.user_id,
+            note=data.get("note", ""),
+            now=now,
         )
         self.samples.append_event(sample_id, "aliquot.source", principal.user_id, now, quantity_delta=-data["requested_quantity"], details={"operation_code": operation_code, "child_ids": [item["id"] for item in children]})
         self.audit.record(principal, "sample.aliquot", "sample", str(sample_id), before=parent, after=updated_parent, metadata={"operation_code": operation_code})
-        return {"operation_code": operation_code, "parent": updated_parent, "children": children}
+        return {"operation_code": operation_code, "operation": operation, "parent": updated_parent, "children": children}
 
     def consume(self, principal: Principal, sample_id: int, data: dict[str, Any]) -> dict[str, Any]:
         principal.require("samples.consume")

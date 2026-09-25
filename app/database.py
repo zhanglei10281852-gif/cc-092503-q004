@@ -212,6 +212,56 @@ CREATE TABLE IF NOT EXISTS aliquot_operations (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS unit_conversion_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_code TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK(version >= 1),
+    from_unit TEXT NOT NULL,
+    to_unit TEXT NOT NULL,
+    factor TEXT NOT NULL,
+    default_tolerance REAL NOT NULL DEFAULT 0.000001 CHECK(default_tolerance >= 0),
+    note TEXT NOT NULL DEFAULT '',
+    created_by INTEGER NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    UNIQUE(rule_code, version),
+    CHECK(from_unit <> to_unit)
+);
+
+CREATE TABLE IF NOT EXISTS lineage_operations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    operation_code TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1 CHECK(version >= 1),
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','superseded')),
+    operation_kind TEXT NOT NULL,
+    parent_sample_id INTEGER NOT NULL REFERENCES samples(id),
+    input_unit TEXT NOT NULL,
+    output_unit TEXT NOT NULL,
+    input_quantity REAL NOT NULL CHECK(input_quantity > 0),
+    output_quantity REAL NOT NULL CHECK(output_quantity >= 0),
+    loss_quantity REAL NOT NULL DEFAULT 0 CHECK(loss_quantity >= 0),
+    loss_reason TEXT NOT NULL DEFAULT '',
+    conversion_rule_id INTEGER REFERENCES unit_conversion_rules(id),
+    conversion_rule_code TEXT,
+    conversion_rule_version INTEGER,
+    conversion_factor TEXT NOT NULL DEFAULT '1',
+    tolerance REAL NOT NULL DEFAULT 0.000001 CHECK(tolerance >= 0),
+    residual REAL NOT NULL DEFAULT 0,
+    operator_user_id INTEGER NOT NULL REFERENCES users(id),
+    occurred_at TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    UNIQUE(operation_code, version)
+);
+CREATE INDEX IF NOT EXISTS idx_lineage_operations_parent ON lineage_operations(parent_sample_id);
+CREATE INDEX IF NOT EXISTS idx_lineage_operations_status ON lineage_operations(operation_code, status);
+
+CREATE TABLE IF NOT EXISTS lineage_operation_children (
+    operation_id INTEGER NOT NULL REFERENCES lineage_operations(id),
+    child_sample_id INTEGER NOT NULL REFERENCES samples(id),
+    quantity REAL NOT NULL CHECK(quantity >= 0),
+    PRIMARY KEY(operation_id, child_sample_id)
+);
+
 CREATE TABLE IF NOT EXISTS loans (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     loan_code TEXT NOT NULL UNIQUE,

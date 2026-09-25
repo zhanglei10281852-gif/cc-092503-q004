@@ -38,3 +38,19 @@ class DestructionExecute(BaseModel):
     method: str = Field(min_length=2, max_length=200)
     witness_one: int = Field(gt=0)
     witness_two: int = Field(gt=0)
+
+
+class ConversionRuleCreate(BaseModel):
+    rule_code: str = Field(min_length=2, max_length=64)
+    from_unit: str = Field(min_length=1, max_length=20)
+    to_unit: str = Field(min_length=1, max_length=20)
+    factor: str = Field(min_length=1, max_length=40)
+    default_tolerance: float = Field(default=0.000001, ge=0)
+    note: str = Field(default="", max_length=500)
+
+
+class OperationCorrection(BaseModel):
+    loss_quantity: float | None = Field(default=None, ge=0)
+    loss_reason: str | None = Field(default=None, max_length=200)
+    tolerance: float | None = Field(default=None, ge=0)
+    note: str = Field(min_length=2, max_length=500)

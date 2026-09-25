@@ -7,12 +7,20 @@ from app.database import get_connection, transaction
 from app.core.security import Principal
 from app.samples.extended_schemas import (
     CollectionCreate,
+    ConversionRuleCreate,
     DestructionExecute,
     InventoryCount,
     InventoryStart,
+    OperationCorrection,
     TransferCreate,
 )
 from app.samples.inventory import InventoryService, StockSummaryService
+from app.samples.lineage import (
+    ConversionRuleService,
+    LineageAnalysisService,
+    LineageOperationService,
+    LineageTraceService,
+)
 from app.samples.operations import CollectionService, DestructionService, LineageService, TransferService
 from app.samples.reporting import BatchReconciliationService, ExceptionAgingService
 
@@ -34,6 +42,43 @@ def transfer_sample(sample_id: int, payload: TransferCreate, principal: Principa
 @router.get("/{sample_id}/lineage")
 def sample_lineage(sample_id: int, principal: Principal = Depends(current_principal)):
     return LineageService(get_connection()).graph(principal, sample_id)
+
+
+@router.post("/conversion-rules", status_code=status.HTTP_201_CREATED)
+def register_conversion_rule(payload: ConversionRuleCreate, principal: Principal = Depends(current_principal)):
+    with transaction(immediate=True) as connection:
+        return ConversionRuleService(connection).register(principal, payload.model_dump())
+
+
+@router.get("/conversion-rules")
+def list_conversion_rules(rule_code: str | None = None, principal: Principal = Depends(current_principal)):
+    return ConversionRuleService(get_connection()).list(principal, rule_code)
+
+
+@router.get("/operations/{operation_code}")
+def operation_history(operation_code: str, principal: Principal = Depends(current_principal)):
+    return LineageOperationService(get_connection()).history(principal, operation_code)
+
+
+@router.post("/operations/{operation_code}/corrections", status_code=status.HTTP_201_CREATED)
+def correct_operation(operation_code: str, payload: OperationCorrection, principal: Principal = Depends(current_principal)):
+    with transaction(immediate=True) as connection:
+        return LineageOperationService(connection).correct(principal, operation_code, payload.model_dump())
+
+
+@router.get("/{sample_id}/lineage/ancestors")
+def lineage_ancestors(sample_id: int, principal: Principal = Depends(current_principal)):
+    return LineageTraceService(get_connection()).ancestors(principal, sample_id)
+
+
+@router.get("/{sample_id}/lineage/rollup")
+def lineage_rollup(sample_id: int, principal: Principal = Depends(current_principal)):
+    return LineageAnalysisService(get_connection()).rollup(principal, sample_id)
+
+
+@router.get("/{sample_id}/lineage/report")
+def lineage_report(sample_id: int, principal: Principal = Depends(current_principal)):
+    return LineageAnalysisService(get_connection()).report(principal, sample_id)
 
 
 @router.post("/inventory", status_code=status.HTTP_201_CREATED)
